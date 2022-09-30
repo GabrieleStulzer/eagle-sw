@@ -8,7 +8,6 @@
 // Internal Drivers
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
-#include "driver/timer.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -51,10 +50,6 @@ static int adc_voltage[2][10];
 
 static bool adc_calibration_init(adc_unit_t unit, adc_atten_t atten, adc_cali_handle_t *out_handle);
 static void adc_calibration_deinit(adc_cali_handle_t handle);
-
-typedef struct {
-    uint64_t event_count;
-} example_queue_element_t;
 
 typedef struct {
     enum Operation operation;
@@ -105,6 +100,16 @@ static bool read_voltage_on_alarm_cb(gptimer_handle_t timer, const gptimer_alarm
     return high_task_awoken == pdTRUE;
 }
 
+static void configure_timer(gptimer_handle_t *timer, gptimer_config_t *timer_config, gptimer_alarm_config_t *alarm_config, uint64_t count, gptimer_event_callbacks_t *cb, QueueHandle_t queue, queue_element_t *el) {
+    ESP_ERROR_CHECK(gptimer_new_timer(timer_config, timer));
+
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(*timer, alarm_config));
+
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(*timer, cb, queue));
+    ESP_ERROR_CHECK(gptimer_enable(*timer));
+
+}
+
 
 void app_main(void)
 {
@@ -151,46 +156,38 @@ void app_main(void)
         return;
     }
 
-    gptimer_handle_t sensor_timer = NULL;
     gptimer_config_t timer_config = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
         .resolution_hz = 1 * 1000 * 1000, // 1MHz, 1 tick = 1us
     };
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &sensor_timer));
 
+
+    gptimer_handle_t sensor_timer = NULL;
+    gptimer_event_callbacks_t st_cb = {
+        .on_alarm = read_sensor_on_alarm_cb, // register user callback
+    };
     gptimer_alarm_config_t alarm_config = {
         .reload_count = 0, // counter will reload with 0 on alarm event
         .alarm_count = 1000000, // period = 1s @resolution 1MHz
         .flags.auto_reload_on_alarm = true, // enable auto-reload
     };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(sensor_timer, &alarm_config));
 
-    gptimer_event_callbacks_t cbs = {
-        .on_alarm = read_sensor_on_alarm_cb, // register user callback
-    };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(sensor_timer, &cbs, queue));
-
+    configure_timer(&sensor_timer, &timer_config, &alarm_config, 1000000, &st_cb, queue, &ele);
+    
 
     gptimer_handle_t voltage_timer = NULL;
-    gptimer_config_t vt_timer_config = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1 * 1000 * 1000, // 1MHz, 1 tick = 1us
+    gptimer_event_callbacks_t vt_cb = {
+        .on_alarm = read_voltage_on_alarm_cb, // register user callback
     };
-    ESP_ERROR_CHECK(gptimer_new_timer(&vt_timer_config, &voltage_timer));
-
     gptimer_alarm_config_t vt_alarm_config = {
         .reload_count = 0, // counter will reload with 0 on alarm event
         .alarm_count = 2000000, // period = 1s @resolution 1MHz
         .flags.auto_reload_on_alarm = true, // enable auto-reload
     };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(voltage_timer, &vt_alarm_config));
 
-    gptimer_event_callbacks_t vt_cbs = {
-        .on_alarm = read_voltage_on_alarm_cb, // register user callback
-    };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(voltage_timer, &vt_cbs, queue));
+    configure_timer(&voltage_timer, &timer_config, &vt_alarm_config, 2000000, &vt_cb, queue, &ele);
+
 
     while (1)
     {
@@ -222,10 +219,7 @@ void app_main(void)
 
             set_led(GREEN_LED_GPIO, 1);
 
-            ESP_ERROR_CHECK(gptimer_enable(sensor_timer));
             ESP_ERROR_CHECK(gptimer_start(sensor_timer));
-
-            ESP_ERROR_CHECK(gptimer_enable(voltage_timer));
             ESP_ERROR_CHECK(gptimer_start(voltage_timer));
 
             state = Run;
@@ -257,7 +251,10 @@ void app_main(void)
         }
     }
 
-    //Tear Down
+    // Tear Down
+
+    // TODO: Deinit timers
+
     ESP_ERROR_CHECK(adc_oneshot_del_unit(adc1_handle));
     if (do_calibration1) {
         adc_calibration_deinit(adc1_cali_handle);
