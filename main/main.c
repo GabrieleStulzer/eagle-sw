@@ -3,9 +3,12 @@
 // Free RTOS Libraries
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 // Internal Drivers
 #include "driver/gpio.h"
+#include "driver/gptimer.h"
+#include "driver/timer.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -33,6 +36,11 @@ enum States {
     Warning
 };
 
+enum Operation {
+    ReadVoltage,
+    ReadSensor
+};
+
 static const char *TAG = "EagleSW";
 
 static enum States state = Start;
@@ -43,6 +51,14 @@ static int adc_voltage[2][10];
 
 static bool adc_calibration_init(adc_unit_t unit, adc_atten_t atten, adc_cali_handle_t *out_handle);
 static void adc_calibration_deinit(adc_cali_handle_t handle);
+
+typedef struct {
+    uint64_t event_count;
+} example_queue_element_t;
+
+typedef struct {
+    enum Operation operation;
+} queue_element_t;
 
 // Green Led State
 // static uint8_t g_led_state = 0;
@@ -63,6 +79,32 @@ static void configure_led(int gpio_n)
     gpio_set_direction(gpio_n, GPIO_MODE_OUTPUT);
 }
 
+static bool read_sensor_on_alarm_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
+{
+    BaseType_t high_task_awoken = pdFALSE;
+    QueueHandle_t queue = (QueueHandle_t)user_ctx;
+
+    queue_element_t ele = {
+        .operation = ReadSensor,
+    };
+
+    xQueueSendFromISR(queue, &ele, &high_task_awoken);
+    return high_task_awoken == pdTRUE;
+}
+
+static bool read_voltage_on_alarm_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
+{
+    BaseType_t high_task_awoken = pdFALSE;
+    QueueHandle_t queue = (QueueHandle_t)user_ctx;
+
+    queue_element_t ele = {
+        .operation = ReadVoltage,
+    };
+
+    xQueueSendFromISR(queue, &ele, &high_task_awoken);
+    return high_task_awoken == pdTRUE;
+}
+
 
 void app_main(void)
 {
@@ -70,6 +112,10 @@ void app_main(void)
 
     configure_led(GREEN_LED_GPIO);
     configure_led(RED_LED_GPIO);
+
+    /*---------------------------------------------------------------
+            ADC Configuration
+    ---------------------------------------------------------------*/
 
     // Init ADC1
     adc_oneshot_unit_handle_t adc1_handle;
@@ -94,6 +140,57 @@ void app_main(void)
     // ADC1 Calibration
     adc_cali_handle_t adc1_cali_handle = NULL;
     bool do_calibration1 = adc_calibration_init(ADC_UNIT_1, ADC_ATTEN_DB_11, &adc1_cali_handle);
+
+    /*---------------------------------------------------------------
+            Timer Configuration
+    ---------------------------------------------------------------*/
+    queue_element_t ele;
+    QueueHandle_t queue = xQueueCreate(10, sizeof(queue_element_t));
+    if (!queue) {
+        ESP_LOGE(TAG, "Creating queue failed");
+        return;
+    }
+
+    gptimer_handle_t sensor_timer = NULL;
+    gptimer_config_t timer_config = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1 * 1000 * 1000, // 1MHz, 1 tick = 1us
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &sensor_timer));
+
+    gptimer_alarm_config_t alarm_config = {
+        .reload_count = 0, // counter will reload with 0 on alarm event
+        .alarm_count = 1000000, // period = 1s @resolution 1MHz
+        .flags.auto_reload_on_alarm = true, // enable auto-reload
+    };
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(sensor_timer, &alarm_config));
+
+    gptimer_event_callbacks_t cbs = {
+        .on_alarm = read_sensor_on_alarm_cb, // register user callback
+    };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(sensor_timer, &cbs, queue));
+
+
+    gptimer_handle_t voltage_timer = NULL;
+    gptimer_config_t vt_timer_config = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1 * 1000 * 1000, // 1MHz, 1 tick = 1us
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&vt_timer_config, &voltage_timer));
+
+    gptimer_alarm_config_t vt_alarm_config = {
+        .reload_count = 0, // counter will reload with 0 on alarm event
+        .alarm_count = 2000000, // period = 1s @resolution 1MHz
+        .flags.auto_reload_on_alarm = true, // enable auto-reload
+    };
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(voltage_timer, &vt_alarm_config));
+
+    gptimer_event_callbacks_t vt_cbs = {
+        .on_alarm = read_voltage_on_alarm_cb, // register user callback
+    };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(voltage_timer, &vt_cbs, queue));
 
     while (1)
     {
@@ -125,20 +222,34 @@ void app_main(void)
 
             set_led(GREEN_LED_GPIO, 1);
 
+            ESP_ERROR_CHECK(gptimer_enable(sensor_timer));
+            ESP_ERROR_CHECK(gptimer_start(sensor_timer));
+
+            ESP_ERROR_CHECK(gptimer_enable(voltage_timer));
+            ESP_ERROR_CHECK(gptimer_start(voltage_timer));
+
             state = Run;
             break;
         
         case Run:
             // Print Sensor data
-            printf("Running Process\n\n");
+            // printf("Running Process\n\n");
 
-            ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &adc_raw[0][0]));
-            ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, ADC_CHANNEL_6, adc_raw[0][0]);
-            if (do_calibration1) {
-                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_handle, adc_raw[0][0], &adc_voltage[0][0]));
-                ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, ADC_CHANNEL_6, adc_voltage[0][0]);
+            if(xQueueReceive(queue, &ele, pdMS_TO_TICKS(2000))){
+                if(ele.operation == ReadSensor) {
+                    ESP_LOGI(TAG,"Reading Sensor");
+                    ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &adc_raw[0][0]));
+                    ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, ADC_CHANNEL_6, adc_raw[0][0]);
+                    if (do_calibration1) {
+                        ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc1_cali_handle, adc_raw[0][0], &adc_voltage[0][0]));
+                        ESP_LOGI(TAG, "ADC%d Channel[%d] Cali Voltage: %d mV", ADC_UNIT_1 + 1, ADC_CHANNEL_6, adc_voltage[0][0]);
+                    }
+                }
+                if (ele.operation == ReadVoltage)
+                {
+                    ESP_LOGI(TAG, "--- Reading Voltage");
+                }
             }
-            vTaskDelay(pdMS_TO_TICKS(2000));
             break;
         
         default:
