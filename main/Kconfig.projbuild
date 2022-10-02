@@ -14,13 +14,32 @@ menu "EagleSW Configuration"
         range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
         default 16
         help
-            GPIO number of red led.
+            GPIO number of led for high voltage alert.
 
-    config DHT_SENSOR_GPIO
-        int "DHT Sensor GPIO Number"
+    config YELLOW_LED_GPIO
+        int "Yyellow Led GPIO number"
         range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
-        default 13
+        default 17
         help
-            GPIO number of DHT sensor.
+            GPIO number of led for low voltage aler.
+
+    config BUTTON_GPIO
+        int "Button GPIO Number"
+        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
+        default 32 
+        help
+            GPIO number of Emergency button sensor.
+
+    config VOLTAGE_ADC
+        int "Voltage ADC Channel"
+        default 6 
+        help
+            Voltage ADC Channel number (not GPIO).
+
+    config SENSOR_ADC
+        int "Sensor ADC Channel"
+        default 7 
+        help
+            Sensor ADC Channel number (not GPIO).
 
 endmenu
